@@ -1,7 +1,9 @@
+// Only operational labels and numeric progress enter logs; never URLs or tokens.
 export function logJob(jobId, message) {
   console.log(`${new Date().toISOString()} [job ${jobId}] ${message}`);
 }
-export function createRenderProgress(duration, report, now = Date.now) {
+
+export function createRenderProgress(duration, report, now = Date.now, onProgress = () => {}) {
   let buffer = "", seconds = 0, speed = "?", last = -Infinity;
   return (chunk) => {
     buffer += chunk.toString();
@@ -20,6 +22,7 @@ export function createRenderProgress(duration, report, now = Date.now) {
       last = time;
       const percent = value === "end" ? 100 : Math.min(99, Math.max(0, Math.floor(seconds / duration * 100)));
       report(`Renderizando: ${percent}% | ${Math.floor(seconds)}s de ${Math.ceil(duration)}s | velocidade ${speed}`);
+      onProgress(percent);
     }
   };
 }

@@ -34,6 +34,14 @@ async function app(action, payload) {
   return json;
 }
 const event = (job_id, data) => app("event", { job_id, ...data });
+const progressChains = new Map();
+function progress(jobId, stage, percent = null) {
+  const next = (progressChains.get(jobId) ?? Promise.resolve()).then(() => app("progress", { job_id: jobId, stage, percent })).catch(() => {
+    logJob(jobId, "Falha ao atualizar progresso no aplicativo");
+  });
+  progressChains.set(jobId, next);
+  return next;
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function download(url, dest) {
@@ -45,7 +53,7 @@ async function download(url, dest) {
 function runFfmpeg(args, jobId, duration) {
   return new Promise((resolve, reject) => {
     const p = spawn("ffmpeg", ["-progress", "pipe:1", "-nostats", ...args], { stdio: ["ignore", "pipe", "pipe"] });
-    p.stdout.on("data", createRenderProgress(duration, (message) => logJob(jobId, message)));
+    p.stdout.on("data", createRenderProgress(duration, (message) => logJob(jobId, message), Date.now, (percent) => { void progress(jobId, "rendering", percent); }));
     let err = "";
     p.stderr.on("data", (d) => { err = (err + d).slice(-4000); });
     p.on("error", reject);
@@ -55,6 +63,7 @@ function runFfmpeg(args, jobId, duration) {
 
 async function uploadRender(jobId, file) {
   logJob(jobId, "Salvando MP4 no aplicativo");
+  await progress(jobId, "saving_mp4");
   const { signed_url, path: p } = await app("render-upload-url", { job_id: jobId });
   const size = (await fsp.stat(file)).size;
   const res = await fetch(signed_url, { method: "PUT", headers: { "content-type": "video/mp4", "content-length": String(size), "x-upsert": "true" }, body: Readable.toWeb(fs.createReadStream(file)), duplex: "half" });
@@ -67,6 +76,7 @@ async function ytToken() { return (await app("youtube-token")).access_token; }
 
 async function youtubeUpload(jobId, file, tpl) {
   logJob(jobId, "Iniciando envio ao YouTube");
+  await progress(jobId, "uploading_youtube", 0);
   const size = (await fsp.stat(file)).size;
   const meta = {
     snippet: { title: tpl.title, description: tpl.description, categoryId: "22" },
@@ -98,8 +108,8 @@ async function youtubeUpload(jobId, file, tpl) {
       try {
         res = await fetch(session, { method: "PUT", headers: { authorization: `Bearer ${await ytToken()}`, "content-length": String(len), "content-range": `bytes ${offset}-${offset + len - 1}/${size}` }, body: buf });
       } catch (e) { res = null; }
-      if (res && (res.status === 200 || res.status === 201)) { logJob(jobId, "Envio ao YouTube: 100%"); return (await res.json()).id; }
-      if (res && res.status === 308) { const r = res.headers.get("range"); offset = r ? Number(r.split("-")[1]) + 1 : 0; failures = 0; logJob(jobId, `Envio ao YouTube: ${Math.min(99, Math.floor(offset / size * 100))}%`); continue; }
+      if (res && (res.status === 200 || res.status === 201)) { logJob(jobId, "Envio ao YouTube: 100%"); await progress(jobId, "uploading_youtube", 100); return (await res.json()).id; }
+      if (res && res.status === 308) { const r = res.headers.get("range"); offset = r ? Number(r.split("-")[1]) + 1 : 0; failures = 0; const percent = Math.min(99, Math.floor(offset / size * 100)); logJob(jobId, `Envio ao YouTube: ${percent}%`); await progress(jobId, "uploading_youtube", percent); continue; }
       if (res && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw Object.assign(new Error(`Upload YouTube falhou [${res.status}]: ${(await res.text()).slice(0, 300)}`), { uncertain: true });
       if (++failures > 6) throw Object.assign(new Error("Upload ao YouTube interrompido após várias tentativas."), { uncertain: true });
       logJob(jobId, `Envio interrompido; consultando a mesma sessão (tentativa ${failures})`);
@@ -114,6 +124,7 @@ async function youtubeUpload(jobId, file, tpl) {
 
 async function waitAvailable(jobId, videoId) {
   logJob(jobId, "Aguardando processamento do YouTube");
+  await progress(jobId, "processing_youtube");
   let delay = 15000;
   const deadline = Date.now() + 90 * 60_000;
   while (Date.now() < deadline) {
@@ -166,11 +177,14 @@ async function processJob(jobId) {
           try {
             const base = path.join(dir, "base.mp4");
             logJob(jobId, "Baixando vídeo base");
+            await progress(jobId, "downloading_base");
             await download(spec.base_video_url, base);
             logJob(jobId, "Vídeo base baixado; baixando imagens");
+            await progress(jobId, "downloading_images");
             const imgs = [];
             for (const im of spec.images) { const p = path.join(dir, `img${im.slot_index}`); await download(im.url, p); imgs[im.slot_index] = p; }
             logJob(jobId, "Imagens baixadas; iniciando renderização");
+            await progress(jobId, "rendering", 0);
             await runFfmpeg(buildFfmpegArgs({ basePath: base, imagePaths: imgs, template, outPath: out }), jobId, template.duration);
             logJob(jobId, "Renderização concluída");
             break;
@@ -199,6 +213,8 @@ async function processJob(jobId) {
     logJob(jobId, "Tarefa interrompida por erro; consulte os detalhes no aplicativo");
     await event(jobId, { type: "error", message: String(e.message ?? e).slice(0, 1500) }).catch(() => {});
   } finally {
+    await progressChains.get(jobId);
+    progressChains.delete(jobId);
     await fsp.rm(dir, { recursive: true, force: true });
     logJob(jobId, "Arquivos temporários removidos");
   }
