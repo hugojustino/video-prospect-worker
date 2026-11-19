@@ -43,7 +43,7 @@ export function buildFfmpegArgs({ basePath, imagePaths, template, outPath }) {
   args.push(
     "-filter_complex", chains.join(";"),
     "-map", "[vout]", "-map", "0:a?",
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p",
     "-c:a", "aac", "-b:a", "192k",
     "-t", f(D), "-movflags", "+faststart", outPath,
   );
