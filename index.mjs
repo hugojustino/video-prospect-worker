@@ -66,9 +66,49 @@ async function youtubeUpload(jobId, file, tpl) {
     snippet: { title: tpl.title, description: tpl.description, categoryId: "22" },
     status: { privacyStatus: "unlisted", selfDeclaredMadeForKids: !!tpl.made_for_kids, embeddable: true },
   };
-  const init = await fetch("https://www.googleapis.com/upload/youtube/v3/videos?qploadType=resumable&part=snippet,status&notifySubscribers=false", {
+  const init = await fetch("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status&notifySubscribers=false", {
     method: "POST",
-    headers: { authorization: `Bearer ${await ytToken()}` } });
+    headers: { authorization: `Bearer ${await ytToken()}`, "content-type": "application/json; charset=UTF-8", "x-upload-content-length": String(size), "x-upload-content-type": "video/mp4" },
+    body: JSON.stringify(meta),
+  });
+  if (!init.ok) {
+    const t = await init.text();
+    if (t.includes("uploadLimitExceeded") || t.includes("quotaExceeded")) throw Object.assign(new Error("Quota diária do YouTube excedida. Tente novamente amanhã."), { noRetry: true });
+    throw Object.assign(new Error(`YouTube recusou o início do upload [${init.status}]: ${t.slice(0, 300)}`), { noRetry: true });
+  }
+  const session = init.headers.get("location");
+  await event(jobId, { type: "youtube_session" }); // a partir daqui, nunca reiniciar upload automaticamente
+
+  const CHUNK = 8 * 1024 * 1024;
+  const fd = await fsp.open(file, "r");
+  let offset = 0, failures = 0;
+  try {
+    while (true) {
+      const len = Math.min(CHUNK, size - offset);
+      const buf = Buffer.alloc(len);
+      await fd.read(buf, 0, len, offset);
+      let res;
+      try {
+        res = await fetch(session, { method: "PUT", headers: { authorization: `Bearer ${await ytToken()}`, "content-length": String(len), "content-range": `bytes ${offset}-${offset + len - 1}/${size}` }, body: buf });
+      } catch (e) { res = null; }
+      if (res && (res.status === 200 || res.status === 201)) return (await res.json()).id;
+      if (res && res.status === 308) { const r = res.headers.get("range"); offset = r ? Number(r.split("-")[1]) + 1 : 0; failures = 0; continue; }
+      if (res && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) throw Object.assign(new Error(`Upload YouTube falhou [${res.status}]: ${(await res.text()).slice(0, 300)}`), { uncertain: true });
+      if (++failures > 6) throw Object.assign(new Error("Upload ao YouTube interrompido após várias tentativas."), { uncertain: true });
+      await sleep(2000 * 2 ** failures);
+      // consulta o estado da sessão para retomar do ponto certo
+      const q = await fetch(session, { method: "PUT", headers: { authorization: `Bearer ${await ytToken()}`, "content-length": "0", "content-range": `bytes */${size}` } }).catch(() => null);
+      if (q && (q.status === 200 || q.status === 201)) return (await q.json()).id;
+      if (q && q.status === 308) { const r = q.headers.get("range"); offset = r ? Number(r.split("-")[1]) + 1 : 0; }
+    }
+  } finally { await fd.close(); }
+}
+
+async function waitAvailable(jobId, videoId) {
+  let delay = 15000;
+  const deadline = Date.now() + 90 * 60_000;
+  while (Date.now() < deadline) {
+    const res = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=status,processingDetails&id=${videoId}`, { headers: { authorization: `Bearer ${await ytToken()}` } });
     if (res.ok) {
       const item = (await res.json()).items?.[0];
       const st = item?.status ?? {};
@@ -102,7 +142,7 @@ async function processJob(jobId) {
       if (job.upload_state !== "nao_iniciado") return event(jobId, { type: "error", upload_uncertain: true, message: "Upload anterior em estado incerto. Revisão manual necessária." });
       const out = path.join(dir, "out.mp4");
       if (job.render_path && spec.render_url) {
-        await download(spec.render_url, out);
+        await download(spec.render_url, out); // reaproveita MP4 já renderizado
       } else {
         let attempt = 0;
         while (true) {
@@ -112,7 +152,7 @@ async function processJob(jobId) {
             const base = path.join(dir, "base.mp4");
             await download(spec.base_video_url, base);
             const imgs = [];
-            for (const im of spec.images) { const p = path.join(dir, `img${ mm.slot_index}`); await download(im.url, p); imgs[im.slot_index] = p; }
+            for (const im of spec.images) { const p = path.join(dir, `img${im.slot_index}`); await download(im.url, p); imgs[im.slot_index] = p; }
             await runFfmpeg(buildFfmpegArgs({ basePath: base, imagePaths: imgs, template, outPath: out }));
             break;
           } catch (e) {
@@ -154,7 +194,7 @@ function pump() {
   }
 }
 
-http.createServer((eq, res) => {
+http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/health") { res.writeHead(200).end("ok"); return; }
   if (req.method !== "POST" || req.url !== "/jobs") { res.writeHead(404).end(); return; }
   let body = "";
